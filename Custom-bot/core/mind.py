@@ -297,15 +297,40 @@ class Mind:
         try:
             reply = await self.chat(message, message.text_content)
         except MindNotReady:
+            await self._knowledge_fallback(message)
             return
         except BudgetExceeded as exc:
             logger.warning("%s", exc)
+            await self._knowledge_fallback(message)
             return
         except Exception as exc:  # noqa: BLE001
-            logger.exception("自动回复失败：%s", exc)
+            logger.exception("自动回复失败，尝试本地知识库：%s", exc)
+            await self._knowledge_fallback(message)
             return
         if reply:
             await self.kernel.reply(message, reply)
+
+    async def _knowledge_fallback(self, message) -> None:
+        """模型不可用时用本地知识库兜底；本地没命中且像问句才联网。"""
+        kb = getattr(self.kernel, "knowledge", None)
+        if not kb or not getattr(kb, "enabled", False) or not getattr(kb, "auto_answer", False):
+            return
+        text = (message.text_content or "").strip()
+        if not text:
+            return
+        try:
+            answer = await kb.answer(text, allow_web=kb.auto_web and kb.looks_like_question(text))
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("知识库兜底失败：%s", exc)
+            return
+        if not answer.ok:
+            return
+        prefix = "〔知识库〕" if answer.local else "〔联网〕"
+        reply = prefix + answer.text
+        sources = [s for s in answer.sources if s.get("url")]
+        if sources:
+            reply += "\n来源：" + "；".join(s["url"] for s in sources[:3])
+        await self.kernel.reply(message, reply[:1800])
 
     # ------------------------------------------------------------------ 学习
     def schedule_learn(self, message) -> None:

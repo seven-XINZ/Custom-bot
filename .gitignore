@@ -13,7 +13,7 @@ data/
 Custom-bot/plugins/generated/
 
 # 本地测试配置
-config/.test-config*.yaml
+config/.test-*.yaml
 
 # 编辑器 / 系统
 .idea/

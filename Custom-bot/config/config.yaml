@@ -76,6 +76,44 @@ mind:
   backup_dir: "data/backups"
   auto_apply: false
 
+# --- 本地知识库：没有模型时的回答兜底，可联网补充 ---
+# 来源：knowledge/ 目录下的 Markdown/文本、手动录入、网页导入、联网搜索缓存
+knowledge:
+  enabled: true
+  # 本地文档目录（相对项目根）；启动时自动切片索引，改完文件可 /kb reindex
+  docs_dir: "knowledge"
+  table: "kb_entries"
+  max_entries: 5000
+  # 单条知识/网页正文最大字符数
+  max_entry_chars: 4000
+  # 回答时最多展示的字符数
+  max_answer_chars: 1200
+  index_docs_on_start: true
+  # 联网搜索：按顺序尝试，前一个失败或没结果才用下一个
+  # bing 直接抓 cn.bing.com；duckduckgo 在部分网络下不可达；searxng 需自建实例
+  search:
+    providers: ["bing", "duckduckgo"]
+    searxng_url: ""
+    timeout: 12
+    max_results: 5
+  web:
+    # 联网结果的本地缓存时间（秒），过期后重新搜索
+    cache_ttl_seconds: 86400
+    max_page_bytes: 2097152
+    # 是否允许抓取内网/本机地址（默认关闭，防止 SSRF；测试本地服务时才开）
+    allow_private_urls: false
+  offline:
+    # 没有模型时，私聊或群里 @/叫名字，自动用知识库回答
+    auto_answer: true
+    # 本地没命中且像问句时，是否允许自动联网
+    auto_web: true
+    # 本地命中所需的最低分数（越高越严格）
+    min_score: 3.0
+    # 主题词覆盖率门槛（0-1，越高越严格，避免只命中一个泛词就作答）
+    min_coverage: 0.6
+    # 同一用户两次自动回答的最小间隔（秒）
+    cooldown_seconds: 60
+
 # --- Web 管理界面 ---
 webui:
   enabled: true
@@ -153,6 +191,9 @@ handlers:
       # 插件级管理员（与 kernel.admins 叠加）
       admins: []
   AI 心智:
+    enabled: true
+    config: {}
+  知识库:
     enabled: true
     config: {}
 

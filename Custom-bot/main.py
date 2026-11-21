@@ -64,7 +64,11 @@ def main(argv=None) -> int:
         if not key:
             key = os.environ.get(str(config.get("brain.api_key_env", "CUSTOM_BOT_LLM_KEY")), "")
         print(f"  心智: {config.get('persona.name', '小栖')} / {model or '未配置模型'}"
-              f"（{'已配置 Key' if key else '缺少 Key，AI 功能不可用'}）")
+              f"（{'已配置 Key' if key else '缺少 Key，AI 功能不可用，将走本地知识库'}）")
+        kb = config.get("knowledge", {}) or {}
+        providers = (kb.get("search", {}) or {}).get("providers", []) or []
+        print(f"  知识库: {'启用' if kb.get('enabled', True) else '停用'} / "
+              f"文档目录 {kb.get('docs_dir', 'knowledge')} / 联网 {', '.join(providers) or '未配置'}")
         return 0
 
     setup_logging(

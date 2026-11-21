@@ -112,6 +112,21 @@ class Config:
         port = self.get("webui.port", 9090)
         if not isinstance(port, int) or not (0 < port < 65536):
             problems.append("webui.port 必须是 1-65535 的整数")
+        kb = self.section("knowledge")
+        if kb.get("enabled", True):
+            providers = (kb.get("search", {}) or {}).get("providers", ["bing"])
+            if not isinstance(providers, list) or not providers:
+                problems.append("knowledge.search.providers 必须是非空列表")
+            elif "searxng" in [str(p).lower() for p in providers] \
+                    and not (kb.get("search", {}) or {}).get("searxng_url"):
+                problems.append("启用 searxng 时必须填写 knowledge.search.searxng_url")
+            coverage = (kb.get("offline", {}) or {}).get("min_coverage", 0.6)
+            try:
+                coverage = float(coverage)
+            except (TypeError, ValueError):
+                coverage = -1
+            if not (0 <= coverage <= 1):
+                problems.append("knowledge.offline.min_coverage 必须在 0-1 之间")
         return problems
 
 
