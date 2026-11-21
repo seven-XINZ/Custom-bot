@@ -1,115 +1,113 @@
 # Custom-bot 配置文件
-# 版本: 1.0 (基于讨论)
-# 作者: Xinz/ahhhahh (及 AI 助手)
+# 版本: 2.0
+# 作者: Xinz / ahhhahh（及 AI 助手）
 
 # --- 内核核心配置 ---
 kernel:
-  # 日志记录级别: DEBUG, INFO, WARNING, ERROR, CRITICAL
+  # 日志级别: DEBUG, INFO, WARNING, ERROR, CRITICAL
   log_level: INFO
-  # (可选) 内部消息队列最大容量
-  # max_queue_size: 1000
-  # 全局管理员用户 ID 列表 (跨平台通用)
-  # !!务必将这里的 ID 替换为你自己的实际用户 ID!!
+  # 框架版本，供「版本」命令与状态页使用
+  version: "1.0.0"
+  # 全局管理员用户 ID（跨平台通用）；填 "*" 表示所有人都是管理员（仅调试用）
+  # !! 务必替换成你自己的实际用户 ID，可先用「id」命令查看 !!
   admins:
-    - "10001"      # 示例：你的 QQ 号或其他平台的数字 ID
-    - "admin_user" # 示例：你的 Telegram 用户名或其他平台的字符串 ID
-  # (可选) 框架版本信息，供 '版本' 命令使用
-  version: "1.0.0-dev"
+    - "10001"
+    - "admin_user"
+  # 命令前缀；留空字符串表示允许无前缀直接命中命令名
+  command_prefixes:
+    - "/"
+    - "!"
+  # 同时处理的消息上限（防止刷屏拖垮内核）
+  max_concurrent: 16
+  # 状态页保留的最近消息条数
+  message_retention: 200
+  # 单条命令默认超时（秒）
+  plugin_timeout: 15
+  # 退出时等待各组件关闭的时间（秒）
+  shutdown_timeout: 10
 
-# --- Web 管理界面配置 ---
+# --- Web 管理界面 ---
 webui:
-  # 是否启用 Web UI
   enabled: true
-  # Web UI 监听的主机地址 ('0.0.0.0' 监听所有接口)
   host: "0.0.0.0"
-  # Web UI 监听的端口
   port: 9090
-  # (可选) WebSocket 推送系统状态的间隔时间 (秒)，范围 1-30
+  # 状态推送间隔（秒），范围 1-30
   stats_interval: 5
-  # (未来功能) Web UI 登录认证配置
-  # auth:
-  #   username: admin
-  #   password_hash: "YOUR_BCRYPT_HASH_HERE" # 首次启动后安全地生成和设置
+  title: "Custom-bot 控制台"
+  # 登录认证；两项都留空 = 不校验（只建议本机或反代后使用）
+  auth:
+    username: ""
+    password: ""
 
-# --- 数据库配置 ---
+# --- 数据库 ---
 database:
-  # 使用的数据库类型 (目前仅 'tinydb')
-  provider: tinydb
-  # 数据库文件存储路径 (相对于项目根目录)
-  path: db/
+  # 目前实现为 JSON 文件（每个表一个文件），保留 tinydb 名称仅为兼容旧配置
+  provider: json
+  # 存储目录（相对项目根）
+  path: data/db
 
-# --- 协议适配器配置 ---
+# --- 日志 ---
+logging:
+  level: INFO
+  dir: data/logs
+  file: custom-bot.log
+  max_bytes: 5242880
+  backup_count: 5
+  console: true
+
+# --- 协议适配器 ---
 adapters:
-  # --- 反向 WebSocket QQ 适配器 (基于 OneBot v11) ---
-  qqbot_reverse_ws: # 给适配器起一个唯一 ID
-    enabled: true    # <<< 启用这个适配器
-    class: Adapter.qq_adapter.QQAdapter # 指向 QQ 适配器类
+  # 反向 WebSocket QQ 适配器（OneBot v11）
+  qqbot_reverse_ws:
+    enabled: true
+    class: Adapter.qq_adapter.QQAdapter
     config:
-      host: "0.0.0.0"             # 监听地址
-      port: 8765                  # <<< 监听端口 (QQ 客户端需要连接这个端口)
-      protocol_name: onebot_rws    # 协议名称标识
-      path: "/onebot/v11/event"   # <<< (重要) 期望 QQ 客户端连接的路径，必须与客户端配置一致！
-      # access_token: "YOUR_SECRET_TOKEN" # (可选) 如果你的 QQ 客户端配置了 Token，在这里填写以进行验证
+      host: "0.0.0.0"
+      port: 8765
+      protocol_name: onebot_rws
+      # 必须与 QQ 客户端（NapCat / LLOneBot 等）里配置的反向 WS 地址路径一致
+      path: "/onebot/v11/event"
+      # access_token: "YOUR_SECRET_TOKEN"
+      api_timeout: 30
 
-  # --- 其他示例适配器 (默认禁用) ---
+  # HTTP Webhook（外部系统推事件进来，也可作为出站通知）
   http_webhook:
-    enabled: false # <<< 禁用 HTTP Webhook 示例
+    enabled: false
     class: Adapter.http_adapter.HttpAdapter
     config:
       host: "0.0.0.0"
       port: 8088
       path: /webhook
+      health_path: /health
       protocol_name: http
+      # access_token: "YOUR_WEBHOOK_TOKEN"
+      # callback_url: "https://example.com/receive"
 
+  # 通用反向 WebSocket（自定义客户端 / 中转程序）
   reverse_ws_example:
-    enabled: false # <<< 禁用通用的反向 WS 示例 (避免与 QQ 适配器端口冲突)
+    enabled: false
     class: Adapter.reverse_ws_adapter.ReverseWebSocketAdapter
     config:
       host: "0.0.0.0"
-      port: 8765 # 与 QQ 适配器端口相同，必须禁用一个
+      port: 8766
+      path: /ws
       protocol_name: reverse_ws
+      # access_token: "YOUR_TOKEN"
 
-  # forward_ws_gocqhttp: # 示例：正向 WS 客户端 (如果需要连接外部服务)
-  #   enabled: false
-  #   class: Adapter.forward_ws_adapter.ForwardWebSocketAdapter
-  #   config:
-  #     url: "ws://127.0.0.1:6700/api" # 连接 go-cqhttp API 示例
-  #     protocol_name: onebot_fws
-  #     reconnect_delay: 5
-
-# --- 处理器/插件配置 ---
+# --- 处理器 / 插件配置 ---
 handlers:
-  # --- 基础命令插件 ---
-  基础命令: # <<< Handler ID (应与插件的 @name 元数据匹配)
-    enabled: true # <<< 启用基础命令插件
-    # class: plugins.官方插件.基础命令.OfficialBasicCommands # class 是可选的
+  # 插件 ID 与插件模块里的 NAME 对应；未列出的插件默认启用
+  基础命令:
+    enabled: true
     config:
-      # 这个插件特定的管理员列表 (如果插件内部逻辑需要区分)
-      # 这些 ID 加上 kernel.admins 中的 ID 都可以触发此插件中需要 admin 的命令
-      admins:
-        - "" # 示例：另一个特定管理员
-        # 可以为空列表: admins: []
+      # 插件级管理员（与 kernel.admins 叠加）
+      admins: []
 
-  # --- 其他插件示例 (默认禁用) ---
-  # 猜数字游戏:
-  #   enabled: false
-  #   config:
-  #     max_attempts: 5
-  #     number_range: [1, 100]
-
-# --- 定时任务配置 ---
+# --- 定时任务 ---
 scheduled_tasks:
-  # --- 示例：一个禁用的每小时任务 ---
-  # example_hourly_task:
-  #   enabled: false # <<< 禁用示例任务
-  #   name: "示例每小时任务"
-  #   script_path: "example_task.py" # 相对于 scripts/ 目录
-  #   schedule: { trigger: "interval", hours: 1 }
-  #   timeout_seconds: 600
-
-  # --- 在这里添加你自己的定时任务 ---
-  # my_daily_report:
-  #   enabled: true
-  #   name: "每日报告生成"
-  #   script_path: "generate_report.py"
-  #   schedule: { trigger: "cron", hour: 8, minute: 0 } # 每天早上 8 点执行
+  heartbeat:
+    enabled: false
+    name: "心跳"
+    script_path: "example_task.py"
+    schedule: { trigger: "interval", minutes: 30 }
+    timeout_seconds: 60

@@ -1,254 +1,458 @@
+"""QQ 适配器（OneBot v11 反向 WebSocket）。
+
+机器人框架作为 WS 服务端，QQ 客户端（NapCat / LLOneBot / Lagrange 等）连上来，
+按 OneBot v11 上报事件、接受 `send_msg` / `delete_msg` 等 API 调用。
+
+兼容 websockets 13+（新 asyncio 实现）与 10~12（handler 带 path 参数）。
+"""
+
+from __future__ import annotations
+
 import asyncio
 import json
 import logging
 import time
 import uuid
-from typing import Dict, Optional, Any, Union
-import inspect # 保留 inspect 用于可能的调试
+from typing import Any, Dict, List, Optional
 
-import websockets
-from websockets.exceptions import ConnectionClosed, ConnectionClosedError, ConnectionClosedOK
-from websockets.server import WebSocketServerProtocol
+try:  # websockets >= 13
+    from websockets.asyncio.server import ServerConnection, serve
+except ImportError:  # pragma: no cover - 兼容旧版
+    from websockets.server import WebSocketServerProtocol as ServerConnection  # type: ignore
+    from websockets.server import serve  # type: ignore
 
-# 导入框架核心组件
+from websockets.exceptions import ConnectionClosed
+
 from core.adapters import BaseAdapter
-from core.message import InternalMessage
+from core.message import Attachment, InternalMessage
 
-# 使用特定于此适配器的 logger
 logger = logging.getLogger("适配器.QQAdapter")
 
-class QQAdapter(BaseAdapter):
-    """
-    QQ 适配器，基于 OneBot v11 标准的反向 WebSocket 实现。
-    作为 WebSocket 服务器运行，等待 QQ 机器人客户端连接。
-    """
-    def __init__(self, kernel, adapter_id, config):
-        super().__init__(kernel, adapter_id, config)
-        self.host: str = config.get('host', '0.0.0.0')
-        self.port: int = int(config.get('port', 8765))
-        self.access_token = config.get('access_token', None)
-        self.event_path = config.get('path', '/onebot/v11/event')
-        self._server: Optional[websockets.server.Serve] = None
-        self._clients: Dict[str, WebSocketServerProtocol] = {}
-        self._server_task: Optional[asyncio.Task] = None
-        self._kernel_running_tasks_ref: Optional[Dict] = getattr(kernel, '_running_tasks', None)
-        self._echo_futures: Dict[str, asyncio.Future] = {}
-        # --- 修改日志级别 ---
-        logger.debug(f"正在初始化适配器 '{self.adapter_id}' (协议: {self.protocol_name})") # INFO -> DEBUG
+# OneBot 消息段 → 内部附件类型
+_SEGMENT_TYPES = {
+    "image": "image",
+    "record": "audio",
+    "voice": "audio",
+    "video": "video",
+    "file": "file",
+}
 
+
+class QQAdapter(BaseAdapter):
+    """OneBot v11 反向 WebSocket 适配器。"""
+
+    kind = "qq"
+
+    def __init__(self, kernel, adapter_id: str, config: Dict[str, Any]):
+        super().__init__(kernel, adapter_id, config)
+        self.host: str = str(config.get("host", "0.0.0.0"))
+        self.port: int = int(config.get("port", 8765))
+        self.event_path: str = str(config.get("path", "/onebot/v11/event"))
+        self.access_token: str = str(config.get("access_token", "") or "")
+        self.api_timeout: float = float(config.get("api_timeout", 30))
+        self._server: Any = None
+        self._server_task: Optional[asyncio.Task] = None
+        self._clients: Dict[str, ServerConnection] = {}
+        self._echo_futures: Dict[str, asyncio.Future] = {}
+        self._queues: Dict[str, asyncio.Queue] = {}
+        self._workers: Dict[str, asyncio.Task] = {}
+        self._self_id: Optional[str] = None
+
+    # ------------------------------------------------------------------ 生命周期
     async def setup(self) -> None:
         await super().setup()
-        # --- 修改日志级别 ---
-        logger.debug(f"QQ 适配器 (反向WS) 将在 ws://{self.host}:{self.port}{self.event_path} 上监听连接。") # INFO -> DEBUG
-        if self.access_token: logger.debug("已配置 Access Token。") # INFO -> DEBUG
-
-    async def _connection_handler(self, websocket: WebSocketServerProtocol, path: str) -> None:
-        try: logger.debug(f"进入 _connection_handler: websocket 类型={type(websocket)}, path='{path}' (类型={type(path)})") # INFO -> DEBUG
-        except Exception as log_err: logger.error(f"打印 _connection_handler 参数时出错: {log_err}")
-
-        connection_id = f"{websocket.remote_address[0]}:{websocket.remote_address[1]}"
-        # logger.info(f"收到来自 {connection_id} 的新 WebSocket 连接，请求路径: '{path}'") # 保留或改为 DEBUG
-
-        if path != self.event_path:
-            logger.warning(f"连接被拒绝: 路径 '{path}' 不匹配期望的路径 '{self.event_path}'。")
-            await websocket.close(code=1008, reason="Invalid path"); return
-        if self.access_token:
-            auth_header = websocket.request_headers.get("Authorization")
-            expected_auth = f"Bearer {self.access_token}"
-            if not auth_header or auth_header != expected_auth:
-                 logger.warning(f"连接被拒绝: Authorization 头无效或不匹配。收到: '{auth_header}'"); await websocket.close(code=1008, reason="Authorization failed"); return
-            logger.debug("Access Token 验证通过。") # INFO -> DEBUG
-
-        self._clients[connection_id] = websocket
-        client_count = len(self._clients)
-        # --- 保留 INFO 级别 ---
-        logger.info(f"QQ 机器人客户端已连接: ID='{connection_id}' (来自路径 '{path}')。当前连接数: {client_count}")
-
-        try:
-            async for message_data in websocket:
-                log_preview = str(message_data[:200]) + ('...' if len(str(message_data)) > 200 else '')
-                logger.debug(f"从 QQ 客户端 '{connection_id}' 收到原始数据: {log_preview}") # INFO -> DEBUG
-
-                try:
-                    event = json.loads(message_data)
-                    if not isinstance(event, dict): logger.warning(f"收到非 JSON 对象格式的数据: {type(event)}，已忽略。"); continue
-                    if 'echo' in event:
-                        echo_id = str(event['echo']); future = self._echo_futures.pop(echo_id, None)
-                        if future and not future.done(): logger.debug(f"收到 Echo 响应 (ID: {echo_id})"); future.set_result(event)
-                        else: logger.debug(f"收到未预期或已超时的 Echo 响应 (ID: {echo_id})，已忽略。")
-                        continue
-                    post_type = event.get("post_type");
-                    if not post_type: logger.warning(f"收到的事件缺少 'post_type' 字段，已忽略: {event}"); continue
-                    if post_type == "meta_event" and event.get("meta_event_type") == "heartbeat": continue
-
-                    # --- 保留或调整事件/消息日志级别 ---
-                    if post_type == "message":
-                         message_type = event.get("message_type"); sub_type = event.get("sub_type")
-                         msg_id = str(event.get("message_id", "")); user_id = str(event.get("user_id", ""))
-                         sender_info = event.get("sender", {}); user_name = str(sender_info.get("nickname", ""))
-                         raw_message = event.get("raw_message", ""); text_content = event.get("message", raw_message)
-                         group_id = None; group_name = None
-                         if message_type == "group": group_id = str(event.get("group_id", "")); group_name = f"Group_{group_id}" if group_id else None
-                         elif message_type == "private": group_id = None; group_name = None
-                         if not user_id: logger.warning(f"收到消息事件但缺少 user_id: {event}"); continue
-
-                         # <<< 保留 INFO 级别，这是你希望看到的 >>>
-                         logger.info(f"QQ适配器收到消息: User={user_id}, Group={group_id or '私聊'}, MsgID={msg_id}, Text='{text_content[:100]}...'")
-
-                         msg = InternalMessage(
-                              adapter_id=self.adapter_id, protocol=self.protocol_name, connection_id=connection_id, user_id=user_id, user_name=user_name,
-                              group_id=group_id, group_name=group_name, msg_id=msg_id, msg_type="text", text_content=text_content, parsed_data=event, raw_data=message_data,
-                              metadata={'onebot_post_type': post_type, 'onebot_message_type': message_type, 'onebot_sub_type': sub_type}, timestamp=event.get("time", time.time())
-                         )
-                         await self._push_to_kernel(msg)
-                    elif post_type:
-                         # 其他事件摘要可以设为 DEBUG 或 INFO，取决于你的需要
-                         logger.debug(f"QQ适配器收到事件: Type={post_type}, SubType={event.get('sub_type') or event.get('notice_type') or event.get('request_type') or 'N/A'}, User={event.get('user_id')}, Group={event.get('group_id')}") # INFO -> DEBUG
-                         # TODO: 将其他事件也转换为 InternalMessage 推送给内核处理
-
-                except json.JSONDecodeError: logger.warning(f"从 QQ 客户端 '{connection_id}' 收到无法解析为 JSON 的数据: {message_data[:100]}...")
-                except Exception as parse_err: logger.error(f"处理来自 QQ 客户端 '{connection_id}' 的数据时出错: {parse_err}", exc_info=True)
-        except ConnectionClosedOK: logger.info(f"QQ 客户端 '{connection_id}' 正常断开连接。")
-        except ConnectionClosedError as e: logger.warning(f"QQ 客户端 '{connection_id}' 连接错误关闭: Code={e.code}, Reason='{e.reason}'")
-        except ConnectionClosed as e: logger.warning(f"QQ 客户端 '{connection_id}' 连接已关闭: {e}")
-        except Exception as e: logger.error(f"处理 QQ 客户端 '{connection_id}' 时发生未知错误: {e}", exc_info=True)
-        finally:
-            if connection_id in self._clients: del self._clients[connection_id]; logger.info(f"已移除 QQ 客户端连接记录: '{connection_id}'。当前连接数: {len(self._clients)}")
+        self.logger.debug("QQ 反向 WS 将监听 ws://%s:%s%s", self.host, self.port, self.event_path)
 
     async def start(self) -> None:
         await super().start()
-        if self._server_task and not self._server_task.done(): logger.warning("QQ 反向 WS 服务器任务已在运行中。"); self.is_running = True; return
+        if self._server is not None:
+            self.logger.warning("QQ 反向 WS 服务已在运行")
+            return
         try:
-            # --- 打印签名日志改为 DEBUG ---
-            try:
-                sig = inspect.signature(self._connection_handler); logger.debug(f"即将传递给 serve 的 handler 签名: {sig}"); param_names = list(sig.parameters.keys()); logger.debug(f"运行时参数列表: {param_names}"); assert 'path' in param_names, "'path' 参数缺失!"
-            except Exception as inspect_err: logger.error(f"检查签名出错: {inspect_err}")
-
-            self._server = await websockets.serve(self._connection_handler, self.host, self.port, ping_interval=30, ping_timeout=20)
+            self._server = await serve(
+                self._connection_handler,
+                self.host,
+                self.port,
+                ping_interval=30,
+                ping_timeout=20,
+                max_size=8 * 1024 * 1024,
+            )
             self.is_running = True
-            # --- 保留 INFO 级别 ---
-            self.logger.info(f"QQ 反向 WS 服务器已启动在 ws://{self.host}:{self.port}{self.event_path}")
-            task_name = f"QQ_RWS_Server_{self.adapter_id}"; self._server_task = asyncio.create_task(self._server.wait_closed(), name=task_name)
-            if self._kernel_running_tasks_ref is not None: self._kernel_running_tasks_ref[task_name] = self._server_task
-        except OSError as e: self.logger.error(f"启动 QQ 反向 WS 服务器失败 (地址: {self.host}:{self.port}): {e}", exc_info=True); self.is_running = False; self._server = None
-        except Exception as e: self.logger.error(f"启动 QQ 反向 WS 服务器时发生未知错误: {e}", exc_info=True); self.is_running = False; self._server = None
+            self.status_extra(listen=f"ws://{self.host}:{self.port}{self.event_path}")
+            self.logger.info("QQ 反向 WS 已启动: ws://%s:%s%s", self.host, self.port, self.event_path)
+            self._server_task = asyncio.create_task(self._server.wait_closed(),
+                                                   name=f"QQ_RWS_{self.adapter_id}")
+        except OSError as exc:
+            self.is_running = False
+            self._count_error(exc)
+            self.logger.error("QQ 反向 WS 启动失败（%s:%s）: %s", self.host, self.port, exc)
+        except Exception as exc:  # noqa: BLE001
+            self.is_running = False
+            self._count_error(exc)
+            self.logger.exception("QQ 反向 WS 启动异常: %s", exc)
 
     async def stop(self) -> None:
+        if self._server is not None:
+            self._server.close()
+            try:
+                await asyncio.wait_for(self._server.wait_closed(), timeout=5)
+            except asyncio.TimeoutError:
+                self.logger.warning("等待 QQ WS 关闭超时")
+        self._server = None
+        if self._server_task:
+            self._server_task.cancel()
+            self._server_task = None
+        for connection_id, ws in list(self._clients.items()):
+            try:
+                await ws.close(code=1001, reason="server shutdown")
+            except Exception:  # noqa: BLE001
+                pass
+            self._clients.pop(connection_id, None)
+        for future in list(self._echo_futures.values()):
+            if not future.done():
+                future.cancel()
+        self._echo_futures.clear()
+        for worker in list(self._workers.values()):
+            worker.cancel()
+        self._workers.clear()
+        self._queues.clear()
         await super().stop()
-        server_closed = False
-        # --- 修改日志级别 ---
-        if self._server and self._server.is_serving(): logger.debug("正在关闭 QQ 反向 WebSocket 服务器...") # INFO -> DEBUG
-        try:
-             if self._server: self._server.close();
-             if self._server_task and not self._server_task.done(): await asyncio.wait_for(self._server_task, timeout=10.0); server_closed = True
-             logger.debug("QQ 反向 WebSocket 服务器已关闭。") # INFO -> DEBUG
-        except asyncio.TimeoutError: logger.warning("等待服务器关闭超时。"); self._server_task.cancel()
-        except asyncio.CancelledError: logger.debug("服务器关闭任务被取消。") # INFO -> DEBUG
-        except Exception as e: logger.error(f"关闭 QQ 反向 WebSocket 服务器时出错: {e}", exc_info=True)
-        finally: self._server = None; self._server_task = None
-        if self._clients:
-             client_count = len(self._clients); logger.debug(f"正在关闭 {client_count} 个 QQ 客户端连接...") # INFO -> DEBUG
-             clients_to_close = list(self._clients.values()); self._clients.clear()
-             close_tasks = [client.close(code=1001, reason="服务器关闭") for client in clients_to_close if client.open]
-             if close_tasks: await asyncio.gather(*close_tasks, return_exceptions=True)
-             logger.debug(f"{len(close_tasks)} 个 QQ 客户端连接已尝试关闭。") # INFO -> DEBUG
-        self.is_running = False
-        logger.debug(f"适配器 '{self.adapter_id}' 已停止。") # INFO -> DEBUG
 
-    async def send(self, message: 'InternalMessage') -> bool:
-        # ... (发送逻辑基本不变，错误日志级别可以按需调整) ...
-        target_connection_id: Optional[str] = message.connection_id
-        if not target_connection_id and len(self._clients) == 1: target_connection_id = next(iter(self._clients.keys()))
-        elif not target_connection_id and len(self._clients) > 1: logger.warning(f"无法发送消息 {message.internal_id}: 有多个 QQ 客户端连接，但未指定 connection_id。"); return False
-        elif target_connection_id not in self._clients: logger.warning(f"无法发送消息 {message.internal_id}: 找不到目标 QQ 客户端连接 '{target_connection_id}'。"); return False
-        if not target_connection_id: logger.error(f"发送消息 {message.internal_id} 时未能确定目标连接 ID。"); return False
+    # ------------------------------------------------------------------ 连接
+    async def _connection_handler(self, websocket: ServerConnection, path: Optional[str] = None):
+        # 新版 websockets 不传 path，需要从握手请求里取
+        request = getattr(websocket, "request", None)
+        if path is None:
+            path = getattr(request, "path", "/") if request else "/"
+        remote = getattr(websocket, "remote_address", None) or ("?", 0)
+        connection_id = f"{remote[0]}:{remote[1]}"
 
-        action: Optional[str] = None; params: Dict[str, Any] = {}
-        if message.msg_type == "text" or message.attachments:
-            action = "send_msg"
-            if message.group_id and message.group_id != '0': params["message_type"] = "group"; params["group_id"] = int(message.group_id)
-            elif message.user_id: params["message_type"] = "private"; params["user_id"] = int(message.user_id)
-            else: logger.error(f"发送消息 {message.internal_id} 失败: 缺少 group_id 或 user_id。"); return False
-            onebot_message_content = []
-            if message.text_content: onebot_message_content.append({"type": "text", "data": {"text": message.text_content}})
-            if message.attachments:
-                 for att in message.attachments:
-                      cq_code_str = self._attachment_to_cqcode_string(att)
-                      if cq_code_str:
-                           if onebot_message_content: onebot_message_content.append({"type": "text", "data": {"text": " "}})
-                           onebot_message_content.append({"type": "text", "data": {"text": cq_code_str}})
-                      else: logger.warning(f"无法将附件 {att} 转换为 CQ 码。")
-            if not onebot_message_content: logger.warning(f"消息 {message.internal_id} 构建 OneBot 消息失败，无有效内容。"); return False
-            params["message"] = onebot_message_content
-        elif message.msg_type == "action_delete":
-             action = "delete_msg"
-             target_msg_ids = message.metadata.get("target_msg_ids")
-             if isinstance(target_msg_ids, list) and target_msg_ids:
-                  try: params["message_id"] = int(target_msg_ids[0])
-                  except (ValueError, TypeError): logger.error(f"删除消息动作 {message.internal_id} 失败: 无效的消息 ID '{target_msg_ids[0]}'。"); return False
-             else: logger.error(f"删除消息动作 {message.internal_id} 失败: 元数据中缺少有效的 target_msg_ids。"); return False
-        if not action: logger.warning(f"无法处理消息 {message.internal_id}: 未知的消息类型或动作。"); return False
+        if path != self.event_path:
+            self.logger.warning("拒绝连接：路径 %r 与期望 %r 不符", path, self.event_path)
+            await websocket.close(code=1008, reason="invalid path")
+            return
+
+        if self.access_token:
+            headers = getattr(request, "headers", {}) if request else {}
+            auth = headers.get("Authorization", "") if hasattr(headers, "get") else ""
+            if auth != f"Bearer {self.access_token}":
+                self.logger.warning("拒绝连接：Access Token 不匹配（收到 %r）", auth)
+                await websocket.close(code=1008, reason="auth failed")
+                return
+
+        self._clients[connection_id] = websocket
+        self.status_extra(clients=len(self._clients))
+        self.logger.info("QQ 客户端已连接: %s（当前 %d 个）", connection_id, len(self._clients))
+
+        # 收包协程只负责读：回执立即唤醒 future，业务事件丢进队列由独立 worker 处理，
+        # 否则「处理消息 → 回复 → 等待回执」会卡住同一个接收循环，造成自锁。
+        queue: asyncio.Queue = asyncio.Queue(maxsize=1000)
+        self._queues[connection_id] = queue
+        worker = asyncio.create_task(self._event_worker(connection_id, queue),
+                                     name=f"QQ_events_{connection_id}")
+        self._workers[connection_id] = worker
 
         try:
-             echo_id = str(uuid.uuid4().hex); api_request = {"action": action, "params": params, "echo": echo_id}
-             future = asyncio.Future(); self._echo_futures[echo_id] = future
-             success = await self._send_to_client(target_connection_id, api_request)
-             if success:
-                  try:
-                       timeout = self.config.get("api_timeout", 30); echo_response = await asyncio.wait_for(future, timeout=timeout)
-                       if isinstance(echo_response, dict) and echo_response.get("status") == "ok": logger.info(f"API 调用 (echo: {echo_id}, action: {action}) 成功。"); return True # 保留 INFO
-                       else: error_info = echo_response.get("msg") or echo_response.get("wording") or "未知错误"; retcode = echo_response.get("retcode", "N/A"); logger.error(f"API 调用 (echo: {echo_id}, action: {action}) 失败: {error_info} (retcode: {retcode})"); return False
-                  except asyncio.TimeoutError: logger.error(f"等待 API 调用 (echo: {echo_id}, action: {action}) 的响应超时。"); self._echo_futures.pop(echo_id, None); return False
-                  except Exception as wait_err: logger.error(f"等待 API 响应 (echo: {echo_id}) 时发生错误: {wait_err}", exc_info=True); return False
-             else: self._echo_futures.pop(echo_id, None); return False
-        except Exception as send_err:
-             logger.error(f"发送 API 请求 (action: {action}) 时发生错误: {send_err}", exc_info=True)
-             if 'echo_id' in locals() and echo_id in self._echo_futures: self._echo_futures[echo_id].cancel("发送 API 请求时出错"); del self._echo_futures[echo_id]
-             return False
-
-    async def _send_to_client(self, connection_id: str, data: Union[Dict, str]) -> bool:
-        websocket = self._clients.get(connection_id)
-        if not websocket or not websocket.open:
-             if connection_id in self._clients: del self._clients[connection_id]; logger.info(f"发送时检测到 QQ 客户端 '{connection_id}' 连接已关闭，已清理。")
-             return False
-        try:
-            if isinstance(data, dict): message_to_send = json.dumps(data, ensure_ascii=False)
-            else: message_to_send = str(data)
-            log_preview = message_to_send[:150] + ('...' if len(message_to_send) > 150 else '')
-            # --- 保留 INFO 级别 ---
-            logger.info(f"QQ适配器发送消息给 {connection_id}: {log_preview}")
-            await websocket.send(message_to_send)
-            return True
+            async for raw in websocket:
+                self._handle_raw(connection_id, raw)
         except ConnectionClosed:
-            logger.warning(f"发送数据到 QQ 客户端 '{connection_id}' 失败：连接已关闭。")
-            if connection_id in self._clients: del self._clients[connection_id]; logger.info(f"清理已关闭 QQ 连接 '{connection_id}'。")
-            return False
-        except Exception as e:
-            self.logger.error(f"向 QQ 客户端 '{connection_id}' 发送数据时发生未知错误: {e}", exc_info=True)
+            self.logger.info("QQ 客户端断开: %s", connection_id)
+        except Exception as exc:  # noqa: BLE001
+            self._count_error(exc)
+            self.logger.exception("处理 QQ 连接 %s 出错: %s", connection_id, exc)
+        finally:
+            try:
+                queue.put_nowait(None)
+            except asyncio.QueueFull:
+                worker.cancel()
+            try:
+                await asyncio.wait_for(worker, timeout=5)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                worker.cancel()
+            except Exception:  # noqa: BLE001
+                self.logger.exception("QQ 事件 worker 退出异常")
+            self._queues.pop(connection_id, None)
+            self._workers.pop(connection_id, None)
+            self._clients.pop(connection_id, None)
+            self.status_extra(clients=len(self._clients))
+            self.logger.info("已移除 QQ 连接 %s（剩余 %d）", connection_id, len(self._clients))
+
+    async def _event_worker(self, connection_id: str, queue: asyncio.Queue) -> None:
+        """顺序消费本连接的业务事件，与收包解耦。"""
+        while True:
+            event = await queue.get()
+            if event is None:
+                return
+            try:
+                await self._process_event(connection_id, event)
+            except Exception as exc:  # noqa: BLE001
+                self._count_error(exc)
+                self.logger.exception("处理 QQ 事件出错: %s", exc)
+
+    def _handle_raw(self, connection_id: str, raw: Any) -> None:
+        try:
+            event = json.loads(raw)
+        except (json.JSONDecodeError, TypeError):
+            self.logger.warning("收到非 JSON 数据: %s", str(raw)[:120])
+            return
+        if not isinstance(event, dict):
+            return
+
+        # API 调用的回执必须在收包协程里立刻处理
+        if "echo" in event:
+            future = self._echo_futures.pop(str(event["echo"]), None)
+            if future and not future.done():
+                future.set_result(event)
+            return
+
+        queue = self._queues.get(connection_id)
+        if queue is None:
+            return
+        try:
+            queue.put_nowait(event)
+        except asyncio.QueueFull:
+            self.logger.warning("QQ 事件队列已满，丢弃 %s 事件", event.get("post_type"))
+
+    async def _process_event(self, connection_id: str, event: Dict[str, Any]) -> None:
+        post_type = event.get("post_type")
+        if not post_type:
+            return
+        if post_type == "meta_event":
+            if event.get("meta_event_type") == "lifecycle":
+                self._self_id = str(event.get("self_id", ""))
+                self.status_extra(self_id=self._self_id)
+            return
+
+        if post_type == "message":
+            await self._push_to_kernel(self._parse_message(connection_id, event))
+            return
+
+        if post_type in {"notice", "request"}:
+            await self._push_to_kernel(self._parse_event(connection_id, event))
+
+    # ------------------------------------------------------------------ 解析
+    def _parse_message(self, connection_id: str, event: Dict[str, Any]) -> InternalMessage:
+        message_type = str(event.get("message_type", "private"))
+        group_id = str(event.get("group_id", "")) if message_type == "group" else None
+        user_id = str(event.get("sender", {}).get("user_id") or event.get("user_id") or "")
+        user_name = str(event.get("sender", {}).get("card")
+                        or event.get("sender", {}).get("nickname") or "")
+        text, attachments = self._parse_segments(event.get("message"), event.get("raw_message", ""))
+
+        return InternalMessage(
+            adapter_id=self.adapter_id,
+            protocol=self.protocol_name,
+            connection_id=connection_id,
+            user_id=user_id or None,
+            user_name=user_name,
+            group_id=group_id,
+            group_name=f"群{group_id}" if group_id else None,
+            msg_id=str(event.get("message_id", "")) or None,
+            msg_type="text",
+            text_content=text,
+            attachments=attachments,
+            parsed_data=event,
+            raw_data=event,
+            metadata={
+                "onebot_post_type": "message",
+                "onebot_message_type": message_type,
+                "onebot_sub_type": event.get("sub_type"),
+                "self_id": str(event.get("self_id", "")),
+            },
+            timestamp=float(event.get("time") or time.time()),
+        )
+
+    def _parse_event(self, connection_id: str, event: Dict[str, Any]) -> InternalMessage:
+        group_id = event.get("group_id")
+        return InternalMessage(
+            adapter_id=self.adapter_id,
+            protocol=self.protocol_name,
+            connection_id=connection_id,
+            user_id=str(event.get("user_id")) if event.get("user_id") else None,
+            group_id=str(group_id) if group_id else None,
+            msg_id=str(event.get("message_id")) if event.get("message_id") else None,
+            msg_type="event",
+            text_content="",
+            parsed_data=event,
+            raw_data=event,
+            metadata={
+                "onebot_post_type": event.get("post_type"),
+                "onebot_event": event.get("notice_type") or event.get("request_type"),
+                "sub_type": event.get("sub_type"),
+            },
+            timestamp=float(event.get("time") or time.time()),
+        )
+
+    def _parse_segments(self, message: Any, raw_message: str) -> tuple[str, List[Attachment]]:
+        """OneBot 数组格式与 CQ 码字符串都转成「纯文本 + 附件」。"""
+        attachments: List[Attachment] = []
+        if isinstance(message, list):
+            parts: List[str] = []
+            for segment in message:
+                if not isinstance(segment, dict):
+                    continue
+                seg_type = str(segment.get("type", "text"))
+                data = segment.get("data", {}) or {}
+                if seg_type == "text":
+                    parts.append(str(data.get("text", "")))
+                elif seg_type in _SEGMENT_TYPES:
+                    attachments.append(Attachment(
+                        type=_SEGMENT_TYPES[seg_type],
+                        file_id=str(data.get("file") or data.get("file_id") or "") or None,
+                        url=str(data.get("url") or "") or None,
+                        name=str(data.get("file") or "") or None,
+                        extra={"onebot": data},
+                    ))
+            return "".join(parts).strip(), attachments
+
+        text = str(message) if isinstance(message, str) else str(raw_message or "")
+        # 简单剥离 CQ 码，图片等无法在本轮解析成真实地址
+        if "CQ:" in text:
+            stripped = []
+            rest = text
+            while "[" in rest and "CQ:" in rest:
+                start = rest.find("[CQ:")
+                end = rest.find("]", start)
+                if end == -1:
+                    break
+                stripped.append(rest[:start])
+                rest = rest[end + 1:]
+            stripped.append(rest)
+            text = "".join(stripped).strip()
+        return text or str(raw_message or "").strip(), attachments
+
+    # ------------------------------------------------------------------ 发送
+    async def send(self, message: InternalMessage) -> bool:
+        connection_id = self._pick_connection(message)
+        if not connection_id:
             return False
 
-    def _attachment_to_cqcode_string(self, attachment: Dict[str, Any]) -> Optional[str]:
-        att_type = attachment.get('type'); file_location = attachment.get('path') or attachment.get('url') or attachment.get('file_id'); base64_data = attachment.get('base64')
-        def cq_escape(text: str) -> str: return str(text).replace('&', '&').replace('[', '[').replace(']', ']').replace(',', ',')
-        if att_type == 'image':
-             if file_location: return f"[CQ:image,file={cq_escape(file_location)}]"
-             elif base64_data:
-                  if isinstance(base64_data, str) and base64_data.startswith("base64://"): return f"[CQ:image,file={base64_data}]"
-                  elif isinstance(base64_data, str) and base64_data.startswith("data:image"): logger.warning("推荐使用 base64:// 格式"); return f"[CQ:image,file={base64_data}]"
-        elif att_type == 'video':
-             if file_location: return f"[CQ:video,file={cq_escape(file_location)}]"
-        elif att_type in ['audio', 'voice']:
-             if file_location: return f"[CQ:record,file={cq_escape(file_location)}]"
-        logger.warning(f"暂不支持将类型为 '{att_type}' 的附件转换为 CQ 码字符串。")
+        action, params = self._build_action(message)
+        if not action:
+            return False
+
+        echo = uuid.uuid4().hex
+        future: asyncio.Future = asyncio.get_running_loop().create_future()
+        self._echo_futures[echo] = future
+        payload = {"action": action, "params": params, "echo": echo}
+
+        if not await self._send_raw(connection_id, payload):
+            self._echo_futures.pop(echo, None)
+            return False
+
+        try:
+            response = await asyncio.wait_for(future, timeout=self.api_timeout)
+        except asyncio.TimeoutError:
+            self._echo_futures.pop(echo, None)
+            self._count_error("api timeout")
+            self.logger.error("API %s 等待回执超时（echo=%s）", action, echo)
+            return False
+        finally:
+            self._echo_futures.pop(echo, None)
+
+        if isinstance(response, dict) and response.get("status") == "ok":
+            return True
+        error = (response or {}).get("msg") or (response or {}).get("wording") or "unknown"
+        self._count_error(error)
+        self.logger.error("API %s 失败: %s (retcode=%s)", action, error, (response or {}).get("retcode"))
+        return False
+
+    def _pick_connection(self, message: InternalMessage) -> Optional[str]:
+        if message.connection_id and message.connection_id in self._clients:
+            return message.connection_id
+        if len(self._clients) == 1:
+            return next(iter(self._clients))
+        if not self._clients:
+            self.logger.warning("没有 QQ 客户端连接，消息无法发送")
+            return None
+        self.logger.warning("有 %d 个 QQ 连接但未指定 connection_id", len(self._clients))
         return None
 
+    def _build_action(self, message: InternalMessage) -> tuple[Optional[str], Dict[str, Any]]:
+        meta = message.metadata or {}
+        # 允许插件直接指定 OneBot action（撤回、禁言、戳一戳等）
+        if meta.get("onebot_action"):
+            return str(meta["onebot_action"]), dict(meta.get("onebot_params", {}))
+
+        if message.msg_type == "action_delete":
+            target = meta.get("target_msg_ids") or []
+            if not target:
+                self.logger.warning("撤回失败：缺少 target_msg_ids")
+                return None, {}
+            try:
+                return "delete_msg", {"message_id": int(target[0])}
+            except (TypeError, ValueError):
+                return None, {}
+
+        params: Dict[str, Any] = {}
+        if message.is_group:
+            params["message_type"] = "group"
+            params["group_id"] = _as_int(message.group_id)
+        elif message.user_id:
+            params["message_type"] = "private"
+            params["user_id"] = _as_int(message.user_id)
+        else:
+            self.logger.warning("发送失败：缺少 group_id / user_id")
+            return None, {}
+
+        segments: List[Dict[str, Any]] = []
+        if message.text_content:
+            segments.append({"type": "text", "data": {"text": message.text_content}})
+        for attachment in message.attachments:
+            segment = self._attachment_segment(attachment)
+            if segment:
+                segments.append(segment)
+        if not segments:
+            return None, {}
+        params["message"] = segments
+        return "send_msg", params
+
+    def _attachment_segment(self, attachment: Attachment) -> Optional[Dict[str, Any]]:
+        location = attachment.path or attachment.url or attachment.file_id
+        if attachment.type == "image":
+            if attachment.base64:
+                return {"type": "image", "data": {"file": attachment.base64}}
+            if location:
+                return {"type": "image", "data": {"file": location}}
+        if attachment.type in {"audio", "voice"} and location:
+            return {"type": "record", "data": {"file": location}}
+        if attachment.type == "video" and location:
+            return {"type": "video", "data": {"file": location}}
+        if attachment.type == "file" and location:
+            return {"type": "file", "data": {"file": location}}
+        return None
+
+    async def _send_raw(self, connection_id: str, payload: Dict[str, Any]) -> bool:
+        ws = self._clients.get(connection_id)
+        if not ws:
+            return False
+        try:
+            await ws.send(json.dumps(payload, ensure_ascii=False))
+            self.logger.debug("→ %s %s", connection_id, payload.get("action"))
+            return True
+        except ConnectionClosed:
+            self._clients.pop(connection_id, None)
+            self.logger.warning("发送时连接已关闭: %s", connection_id)
+            return False
+        except Exception as exc:  # noqa: BLE001
+            self._count_error(exc)
+            self.logger.exception("向 %s 发送失败: %s", connection_id, exc)
+            return False
+
+    # ------------------------------------------------------------------ 状态
     def get_status(self) -> Dict[str, Any]:
-         base_status = super().get_status()
-         base_status.update({
-              "listening": self.is_running and self._server is not None and self._server.is_serving(),
-              "listen_address": f"ws://{self.host}:{self.port}{self.event_path}",
-              "connected_clients": len(self._clients),
-              "expected_path": self.event_path,
-              "access_token_enabled": bool(self.access_token),
-         })
-         return base_status
+        status = super().get_status()
+        status.update({
+            "listen": f"ws://{self.host}:{self.port}{self.event_path}",
+            "clients": len(self._clients),
+            "self_id": self._self_id,
+            "token": bool(self.access_token),
+        })
+        return status
+
+
+def _as_int(value: Any) -> Any:
+    try:
+        return int(str(value))
+    except (TypeError, ValueError):
+        return value

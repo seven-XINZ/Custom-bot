@@ -1,0 +1,18 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# 运行时数据（数据库与日志）
+data/
+*.log
+
+# 本地测试配置
+config/.test-config*.yaml
+
+# 编辑器 / 系统
+.idea/
+.vscode/
+.DS_Store
