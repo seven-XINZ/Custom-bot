@@ -24,6 +24,7 @@ from .config import Config
 from .database import JsonDatabase
 from .handlers import HandlerManager
 from .message import Attachment, InternalMessage
+from .mind import Mind
 from .scheduler import Scheduler
 from .utils import fmt_time, human_duration, truncate
 from .webui import WebUI
@@ -43,6 +44,7 @@ class RobotKernel:
         self.handlers = HandlerManager(self, self._resolve("plugins"))
         self.scheduler = Scheduler(self, self._resolve("scripts"))
         self.webui = WebUI(self)
+        self.mind = Mind(self)
         self.start_time = time.time()
         self.messages_handled = 0
         self.commands_handled = 0
@@ -64,6 +66,7 @@ class RobotKernel:
         for problem in problems:
             logger.warning("配置问题: %s", problem)
         await self._load_adapters()
+        await self.mind.setup()
         await self.handlers.load_all()
         logger.info("内核装配完成：%d 个适配器、%d 个插件", len(self.adapters), len(self.handlers.plugins))
 
@@ -145,6 +148,10 @@ class RobotKernel:
             await asyncio.wait_for(self.webui.stop(), timeout=timeout)
         except Exception as exc:  # noqa: BLE001
             logger.warning("停止 WebUI 时出错: %s", exc)
+        try:
+            await asyncio.wait_for(self.mind.close(), timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("停止心智时出错: %s", exc)
         await self.db.close()
         logger.info("Custom-bot 已退出（运行 %s）", human_duration(time.time() - self.start_time))
 
@@ -244,5 +251,6 @@ class RobotKernel:
             "commands_handled": self.commands_handled,
             "errors": self.errors,
             "recent_messages": list(self._recent)[-20:],
+            "mind": self.mind.status(),
             "webui": {"running": self.webui.is_running(), "port": self.webui.port},
         }

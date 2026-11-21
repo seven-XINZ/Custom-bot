@@ -9,6 +9,9 @@ venv/
 data/
 *.log
 
+# AI 生成并安装的插件（运行时产物；要保留就手动从 .gitignore 移除）
+Custom-bot/plugins/generated/
+
 # 本地测试配置
 config/.test-config*.yaml
 

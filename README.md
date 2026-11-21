@@ -7,6 +7,7 @@
 ## 特性
 
 - **异步内核**：消息总线、并发上限、优雅退出、组件级故障隔离（某个适配器起不来不影响其他组件）。
+- **AI 心智**：可接任意 OpenAI 兼容模型；有人格、有长期记忆、会从对话里学习、能定期自省，还能生成插件/代码提案交管理员审批。
 - **三种适配器**：QQ（OneBot v11 反向 WebSocket）、HTTP Webhook、通用反向 WebSocket。均兼容 `websockets` 12～15。
 - **插件系统**：模块级 `setup(ctx)` + 命令装饰器，支持别名、管理员限定、超时、热重载、启停；`on_message` 监听器可处理非命令消息。
 - **定时任务**：自实现 5 段 cron（支持 `*/n`、`a-b`、`a,b`、`a-b/n`，日/周同时受限按 Vixie cron 的 OR 规则）与 interval 两种触发方式；任务脚本同步/异步皆可。
@@ -23,6 +24,9 @@ Custom-bot/                 # 项目根（运行目录）
 │   └── config.yaml         # 全部运行配置
 ├── core/
 │   ├── kernel.py           # 内核：装配、消息分发、回复、状态汇总
+│   ├── mind.py             # 心智：人格、对话、记忆、自省、提案审批
+│   ├── llm.py              # OpenAI 兼容模型客户端
+│   ├── memory.py           # 长期记忆（事实 + 对话片段）
 │   ├── adapters.py         # BaseAdapter 抽象基类
 │   ├── message.py          # InternalMessage / Attachment
 │   ├── handlers.py         # 命令注册、插件运行时、分发
@@ -36,9 +40,11 @@ Custom-bot/                 # 项目根（运行目录）
 │   ├── http_adapter.py     # HTTP webhook 出入站
 │   └── reverse_ws_adapter.py# 通用反向 WS
 ├── plugins/
-│   └── official/basic.py   # 基础命令插件（11 条命令）
+│   ├── official/basic.py   # 基础命令插件（11 条命令）
+│   └── official/ai.py      # AI 心智插件（对话/记忆/自省/提案）
 ├── scripts/
-│   └── example_task.py     # 示例定时任务
+│   ├── example_task.py     # 示例定时任务
+│   └── mind_tick.py        # 定时自省任务
 └── data/                   # 运行时生成：db/ 与 logs/
 ```
 
@@ -89,6 +95,91 @@ python3 main.py                  # 启动
 > `enable/disable/reload` 在插件被停用后仍可用：内核为这三条管理动作保留了兜底实现，避免「停用后只能改配置文件」的死角。
 
 前缀由 `kernel.command_prefixes` 决定（默认 `/`、`!`）；也支持不带前缀直接发命令名（整句精确匹配，避免误触发）。
+
+## AI 心智
+
+内核里有一个可接任意 OpenAI 兼容模型的「心智」：人格 + 长期记忆 + 自动学习 + 自省 + 插件/代码提案。
+
+### 接通模型
+
+```yaml
+brain:
+  base_url: "https://api.openai.com/v1"
+  model: "gpt-4o-mini"
+  api_key: ""                       # 也可以留空，用环境变量
+  api_key_env: "CUSTOM_BOT_LLM_KEY"
+```
+
+```bash
+export CUSTOM_BOT_LLM_KEY="sk-..."
+```
+
+常见服务：OpenAI `https://api.openai.com/v1`；DeepSeek `https://api.deepseek.com/v1`；火山方舟 `https://ark.cn-beijing.volces.com/api/v3`（model 填推理接入点 ID）；本地 vLLM / Ollama 网关填对应地址即可。改完重启，发 `/brain` 看到「就绪」即通。
+
+### 对话与学习
+
+- 私聊默认自动接话；群聊需要 @ 机器人或叫名字（`mind.trigger_names`，默认「小栖」）。
+- 每个用户有回复冷却（`cooldown_seconds`）和独立上下文（`history_turns`）。
+- 后台会从对话里提取稳定事实（口味、身份、习惯、约定），按 `learn_cooldown_seconds` 限频；寒暄和一次性请求不会入库。
+- 记忆按相关度注入系统提示，事实表满了自动淘汰最旧的。
+- 每天有调用上限 `max_llm_calls_per_day`，超了直接拒答，不会无上限烧 token。
+
+### 人格
+
+`persona` 段定义名字、自述、性格、口吻与边界；运行时也能改：
+
+```text
+/persona
+/persona set style 更简短一点，别超过两句话
+/persona reset
+```
+
+覆盖值写入 `data/db/persona.json`，重启保留。
+
+### 自省
+
+- `/reflect` 立即回顾最近对话与运行状态，输出一段自我评价，存进 `mind_journal`。
+- `/journal` 查看历史自省。
+- 定时自省默认关闭；在 `scheduled_tasks.mind_reflection` 打开后按 interval 运行（默认 6 小时）。
+- `mind.proactive: true` 会把自省私聊给管理员，默认每天最多一次。
+
+### 让它写插件 / 改代码
+
+```text
+/propose 做一个骰子插件，命令 /roll 2d6
+/propose --target 基础命令 在 ping 回复里加一句“我在”
+/proposals
+/approve p-20261121-132311-7a50
+/reject  p-20261121-132311-7a50
+/rollback 基础命令
+```
+
+安全边界：
+
+1. 提案先写到 `data/proposals/<id>/`（含 `meta.json`、`plugin.py`、改旧插件时的 `diff.txt`），不动线上代码；
+2. 应用前做语法编译 + AST 校验：必须有模块级 `NAME`、`setup(ctx)`，禁止 `subprocess`、`eval/exec`、`os.system` 等；
+3. 改现有插件先备份到 `data/backups/<插件名>/`，加载失败自动还原；`/rollback` 回到最近备份；
+4. 新插件安装到 `plugins/generated/`（已加入 `.gitignore`），下次启动会被自动发现；
+5. `mind.auto_apply: true` 可跳过人工审批直接应用，不建议长期开启。
+
+### 心智命令
+
+| 命令 | 别名 | 说明 |
+| --- | --- | --- |
+| `chat` | 聊、问 | 显式对话（不依赖自动接话） |
+| `brain` | 心智 | 模型、人格、调用量、记忆与提案状态 |
+| `remember` | 记住 | 手动记一条：`/remember 口味 = 微辣` |
+| `recall` | 回忆 | 按关键词检索记忆 |
+| `forget` | 忘掉 | 删除一条记忆 |
+| `persona` | 人格 | 查看/修改人格（管理员） |
+| `reflect` | 自省 | 立即自省（管理员） |
+| `journal` | 日记 | 查看自省记录（管理员） |
+| `feedback` | 反馈 | 对回复风格提意见，写入长期记忆 |
+| `propose` | 提案 | 生成插件/改写提案（管理员） |
+| `proposals` | — | 列出提案（管理员） |
+| `approve` | — | 应用提案（管理员） |
+| `reject` | — | 放弃提案（管理员） |
+| `rollback` | 回滚 | 还原插件备份（管理员） |
 
 ## 写一个插件
 
@@ -150,6 +241,8 @@ cron 五段为 `分 时 日 月 周`，周字段 0/7 均为周日；也接受 `s
 
 ## Web 控制台与 API
 
+面板除了适配器、插件、任务与日志，还会显示 AI 心智是否就绪、模型、人格和今日调用量。
+
 | 方法 | 路径 | 说明 |
 | --- | --- | --- |
 | GET | `/` | 状态面板（暗色单页，WebSocket 自动刷新） |
@@ -172,6 +265,9 @@ cron 五段为 `分 时 日 月 周`，周字段 0/7 均为周日；也接受 `s
 | `kernel.command_prefixes` | `["/", "!"]` | 命令前缀；含空串表示允许无前缀 |
 | `kernel.max_concurrent` | `16` | 同时处理消息上限 |
 | `kernel.plugin_timeout` | `15` | 单条命令默认超时（秒） |
+| `brain.*` | 见配置 | 模型地址、模型名、Key（也可用环境变量） |
+| `persona.*` | 见配置 | 名字、性格、口吻、边界 |
+| `mind.auto_reply` | `true` | 是否自动接话；群聊另需 @ 或叫名字 |
 | `database.path` | `data/db` | JSON 表目录（相对项目根） |
 | `logging.*` | 见配置文件 | 日志级别、目录、轮转大小与备份数 |
 | `adapters.*.class` | — | 适配器类路径，如 `Adapter.qq_adapter.QQAdapter` |
@@ -187,6 +283,8 @@ cron 五段为 `分 时 日 月 周`，周字段 0/7 均为周日；也接受 `s
 - **`ImportError: cannot import name 'WebSocketServerProtocol'`**：`websockets` 15 移除了旧 API。本项目已兼容（优先用 `websockets.asyncio.server`，缺失时回退旧模块），无需降级。
 - **QQ 连不上 / 401**：检查路径必须完全一致（默认 `/onebot/v11/event`）、Token 一致、端口未被占用。
 - **命令没反应**：确认前缀、插件是否被停用（`/plugins` 查看）、发送者是否在 `kernel.admins`。
+- **AI 不接话**：先 `/brain` 看是否「就绪」；未就绪检查 `brain.base_url/model/api_key`；群聊要 @ 或叫名字；同一用户 5 秒内只回一次。
+- **提案应用失败**：看 `data/proposals/<id>/meta.json` 与日志；代码校验不过（缺 `NAME/setup` 或含禁用内容）会被拒绝，改完再 `/propose`。
 - **端口冲突**：QQ 8765 / WebUI 9090 / HTTP 8088 / 通用 WS 8766，改 `config.yaml` 对应 `port` 即可。
 - **数据在哪**：`data/db/*.json`、`data/logs/custom-bot.log`（均在 `Custom-bot/` 下，已加入 `.gitignore`）。
 

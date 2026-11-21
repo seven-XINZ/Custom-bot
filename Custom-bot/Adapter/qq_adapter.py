@@ -238,6 +238,22 @@ class QQAdapter(BaseAdapter):
         user_name = str(event.get("sender", {}).get("card")
                         or event.get("sender", {}).get("nickname") or "")
         text, attachments = self._parse_segments(event.get("message"), event.get("raw_message", ""))
+        self_id = str(event.get("self_id") or self._self_id or "")
+        metadata: Dict[str, Any] = {
+            "onebot_post_type": "message",
+            "onebot_message_type": message_type,
+            "onebot_sub_type": event.get("sub_type"),
+            "self_id": self_id,
+        }
+        # 记录是否 @ 了机器人，供 AI 心智判断群聊要不要接话
+        segments = event.get("message")
+        if isinstance(segments, list):
+            at_ids = [
+                str(seg.get("data", {}).get("qq", ""))
+                for seg in segments
+                if isinstance(seg, dict) and seg.get("type") == "at"
+            ]
+            metadata["mentioned_bot"] = any(qq in {self_id, "all"} for qq in at_ids if qq)
 
         return InternalMessage(
             adapter_id=self.adapter_id,
@@ -253,12 +269,7 @@ class QQAdapter(BaseAdapter):
             attachments=attachments,
             parsed_data=event,
             raw_data=event,
-            metadata={
-                "onebot_post_type": "message",
-                "onebot_message_type": message_type,
-                "onebot_sub_type": event.get("sub_type"),
-                "self_id": str(event.get("self_id", "")),
-            },
+            metadata=metadata,
             timestamp=float(event.get("time") or time.time()),
         )
 

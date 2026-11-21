@@ -270,6 +270,8 @@ max-height:320px;overflow:auto;font-size:12px;line-height:1.55;color:#b9c2d0;mar
   <div class="card"><h2>适配器</h2><div class="big" id="adapters">—</div></div>
   <div class="card"><h2>插件</h2><div class="big" id="plugins">—</div></div>
   <div class="card"><h2>已处理消息</h2><div class="big" id="messages">—</div></div>
+  <div class="card"><h2>AI 心智</h2><div class="big" id="mind">—</div>
+    <div class="sub" id="mind-sub" style="margin:4px 0 0"></div></div>
 </div>
 
 <div class="sec card"><h2>适配器</h2><table id="adapter-table">
@@ -293,6 +295,11 @@ function paint(d){
   $('#adapters').textContent=d.adapter_summary.running+' / '+d.adapter_summary.total;
   $('#plugins').textContent=d.plugin_summary.enabled+' / '+d.plugin_summary.total;
   $('#messages').textContent=d.messages_handled;
+  if(d.mind){
+    $('#mind').textContent=d.mind.ready?'就绪':'未接通';
+    $('#mind').style.color=d.mind.ready?'var(--accent)':'var(--dim)';
+    $('#mind-sub').textContent=`${d.mind.persona||''} · ${d.mind.model||'无模型'} · 今日 ${d.mind.calls_today}/${d.mind.max_calls_per_day}`;
+  }
   $('#adapter-table tbody').innerHTML=d.adapters.map(a=>`<tr><td>${esc(a.id)}</td><td>${esc(a.protocol)}</td>
     <td><span class="tag ${a.running?'ok':'no'}">${a.running?'运行':'停止'}</span></td>
     <td>${a.stats.received} / ${a.stats.sent}</td><td>${esc(a.last_error||'—')}</td></tr>`).join('');

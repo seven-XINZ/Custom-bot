@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import os
 import sys
 from pathlib import Path
 
@@ -58,6 +59,12 @@ def main(argv=None) -> int:
         print(f"  适配器: {len(list(config.iter_adapters()))} 个")
         print(f"  插件配置: {len(list(config.iter_handlers()))} 个")
         print(f"  WebUI: {config.get('webui.host')}:{config.get('webui.port')}")
+        model = str(config.get("brain.model", "") or "")
+        key = str(config.get("brain.api_key", "") or "")
+        if not key:
+            key = os.environ.get(str(config.get("brain.api_key_env", "CUSTOM_BOT_LLM_KEY")), "")
+        print(f"  心智: {config.get('persona.name', '小栖')} / {model or '未配置模型'}"
+              f"（{'已配置 Key' if key else '缺少 Key，AI 功能不可用'}）")
         return 0
 
     setup_logging(
