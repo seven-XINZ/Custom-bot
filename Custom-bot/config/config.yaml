@@ -165,9 +165,9 @@ scheduled_tasks:
     schedule: { trigger: "interval", minutes: 30 }
     timeout_seconds: 60
 
-  # 定期自省：默认关闭，想让它「晚上想事情」时打开
+  # 定期自省：每 6 小时回顾最近对话与状态，写进 mind_journal（不会主动打扰）
   mind_reflection:
-    enabled: false
+    enabled: true
     name: "自省"
     script_path: "mind_tick.py"
     schedule: { trigger: "interval", hours: 6 }

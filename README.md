@@ -140,7 +140,7 @@ export CUSTOM_BOT_LLM_KEY="sk-..."
 
 - `/reflect` 立即回顾最近对话与运行状态，输出一段自我评价，存进 `mind_journal`。
 - `/journal` 查看历史自省。
-- 定时自省默认关闭；在 `scheduled_tasks.mind_reflection` 打开后按 interval 运行（默认 6 小时）。
+- 定时自省默认每 6 小时运行一次（`scheduled_tasks.mind_reflection`），不需要就设为 `false`。
 - `mind.proactive: true` 会把自省私聊给管理员，默认每天最多一次。
 
 ### 让它写插件 / 改代码
